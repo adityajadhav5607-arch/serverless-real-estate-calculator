@@ -1,0 +1,174 @@
+import json
+import boto3
+import datetime
+import traceback
+from decimal import Decimal 
+from botocore.exceptions import ClientError 
+
+# Initialize DynamoDB client outside the handler for efficiency
+dynamodb = boto3.resource('dynamodb')
+table_name = 'YourUserCalculationsTable' 
+dynamodb_table = dynamodb.Table(table_name)
+
+def lambda_handler(event, context):
+    print("Received event:", json.dumps(event))
+
+    try:
+        if 'body' in event and isinstance(event['body'], str):
+            body_str = event.get('body') 
+            try:
+                body = json.loads(body_str)
+                print("Parsed request body from 'body' key:", body)
+            except json.JSONDecodeError as e:
+                print(f"JSON Decode Error: {e} - Raw body: {body_str}")
+                return {
+                    'statusCode': 400,
+                    'headers': {
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*',
+                        'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
+                    },
+                    'body': json.dumps({'error': 'Invalid JSON format in request body.'})
+                }
+        else:
+            body = event
+            print("Assuming event itself is the request body (non-proxy integration):", body)
+
+        def get_float_param(data_dict, key):
+            value = data_dict.get(key)
+            if value is None or (isinstance(value, str) and value.strip() == ''):
+                print(f"Parameter '{key}' is None or empty string.")
+                return None 
+            try:
+                return float(value)
+            except (ValueError, TypeError) as e:
+                print(f"Error converting '{key}' with value '{value}' to float: {e}")
+                return None 
+
+        purchase_price = get_float_param(body, 'purchasePrice')
+        down_payment_percentage = get_float_param(body, 'downPaymentPercentage')
+        interest_rate = get_float_param(body, 'interestRate')
+        loan_term = get_float_param(body, 'loanTerm')
+        estimated_monthly_rent = get_float_param(body, 'estimatedMonthlyRent')
+        estimated_monthly_expenses = get_float_param(body, 'estimatedMonthlyExpenses')
+
+        if any(v is None for v in [purchase_price, down_payment_percentage, interest_rate,
+                                 loan_term, estimated_monthly_rent, estimated_monthly_expenses]) or \
+           purchase_price <= 0 or down_payment_percentage < 0 or interest_rate < 0 or \
+           loan_term <= 0 or estimated_monthly_rent < 0 or estimated_monthly_expenses < 0:
+            
+            missing_params = []
+            if purchase_price is None or purchase_price <= 0: missing_params.append('purchasePrice')
+            if down_payment_percentage is None or down_payment_percentage < 0: missing_params.append('downPaymentPercentage')
+            if interest_rate is None or interest_rate < 0: missing_params.append('interestRate')
+            if loan_term is None or loan_term <= 0: missing_params.append('loanTerm')
+            if estimated_monthly_rent is None or estimated_monthly_rent < 0: missing_params.append('estimatedMonthlyRent')
+            if estimated_monthly_expenses is None or estimated_monthly_expenses < 0: missing_params.append('estimatedMonthlyExpenses')
+            
+            error_message = f"Please provide valid positive numbers for all fields. Missing/Invalid: {', '.join(missing_params) if missing_params else 'None'}"
+            print("Validation failed:", error_message)
+
+            return {
+                'statusCode': 400,
+                'headers': {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
+                },
+                'body': json.dumps({'error': error_message})
+            }
+
+        down_payment_amount = purchase_price * (down_payment_percentage / 100)
+        loan_amount = purchase_price - down_payment_amount
+
+        monthly_interest_rate = (interest_rate / 100) / 12
+        number_of_payments = loan_term * 12
+
+        monthly_mortgage_payment = 0
+        if monthly_interest_rate == 0:
+            monthly_mortgage_payment = loan_amount / number_of_payments
+        else:
+            monthly_mortgage_payment = loan_amount * (monthly_interest_rate * (1 + monthly_interest_rate)**number_of_payments) / (((1 + monthly_interest_rate)**number_of_payments) - 1)
+
+        total_monthly_income = estimated_monthly_rent
+        total_monthly_outgoings = monthly_mortgage_payment + estimated_monthly_expenses
+        net_monthly_profit_loss = total_monthly_income - total_monthly_outgoings
+
+        response_data = {
+            'loanAmount': round(loan_amount, 2),
+            'monthlyMortgagePayment': round(monthly_mortgage_payment, 2),
+            'totalMonthlyIncome': round(total_monthly_income, 2),
+            'totalMonthlyOutgoings': round(total_monthly_outgoings, 2),
+            'netMonthlyProfitLoss': round(net_monthly_profit_loss, 2)
+        }
+        print("Calculation successful. Response data:", response_data)
+
+        user_id = "anonymous_user_id"
+        timestamp = datetime.datetime.now().isoformat()
+
+
+        item_to_save = {
+            'keyIn': f"{user_id}#{timestamp}", 
+            'sortKey': timestamp,              
+            'userId': user_id,
+            'timestamp_original': timestamp, 
+            'purchasePrice': Decimal(str(purchase_price)), 
+            'downPaymentPercentage': Decimal(str(down_payment_percentage)),
+            'interestRate': Decimal(str(interest_rate)),
+            'loanTerm': Decimal(str(loan_term)),
+            'estimatedMonthlyRent': Decimal(str(estimated_monthly_rent)),
+            'estimatedMonthlyExpenses': Decimal(str(estimated_monthly_expenses)),
+            'loanAmount': Decimal(str(response_data['loanAmount'])),
+            'monthlyMortgagePayment': Decimal(str(response_data['monthlyMortgagePayment'])),
+            'totalMonthlyIncome': Decimal(str(response_data['totalMonthlyIncome'])),
+            'totalMonthlyOutgoings': Decimal(str(response_data['totalMonthlyOutgoings'])),
+            'netMonthlyProfitLoss': Decimal(str(response_data['netMonthlyProfitLoss']))
+        }
+
+        try:
+            print(f"Attempting to save item to DynamoDB table '{table_name}': {json.dumps(item_to_save, cls=DecimalEncoder)}")
+            dynamodb_table.put_item(Item=item_to_save)
+            print(f"Successfully saved item to DynamoDB: {item_to_save['keyIn']}") # Refer to the new key name
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            if error_code == 'ResourceNotFoundException':
+                print(f"DynamoDB Error: Table '{table_name}' not found. Please ensure the table exists and the name is correct. Error: {e}")
+            elif error_code == 'AccessDeniedException':
+                print(f"DynamoDB Error: Access Denied for table '{table_name}'. Check Lambda's IAM role permissions. Error: {e}")
+            elif error_code == 'ValidationException': # <--- Added specific handling for ValidationException
+                print(f"DynamoDB Validation Error: Check your item attributes against table schema (e.g., missing primary key, incorrect type). Error: {e}")
+            else:
+                print(f"An unexpected Boto3 ClientError occurred while saving to DynamoDB: {error_code} - {e}")
+            traceback.print_exc() 
+        except Exception as db_e:
+            print(f"An unexpected general DynamoDB error occurred: {db_e}")
+            traceback.print_exc() 
+
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
+            },
+            'body': json.dumps(response_data)
+        }
+
+    except Exception as e:
+        print(f"An unhandled exception occurred: {e}")
+        traceback.print_exc()
+        return {
+            'statusCode': 500,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
+            },
+            'body': json.dumps({'error': f'An unexpected error occurred: {str(e)}'})
+        }
+
+class DecimalEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, Decimal):
+            return str(obj)
+        return json.JSONEncoder.default(self, obj)
